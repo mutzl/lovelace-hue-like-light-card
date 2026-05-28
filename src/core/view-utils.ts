@@ -12,7 +12,28 @@ import { HaIcon, IHassWindow } from '../types/types-hass';
 import { SliderType } from '../types/types-config';
 import { HueMushroomSliderContainer } from '../controls/mushroom-slider-container';
 
+interface ISlideState {
+    lastSlideTime: number;
+    pinnedValue: number | null;
+    holdTimer: ReturnType<typeof setTimeout> | null;
+    watchdogTimer: ReturnType<typeof setTimeout> | null;
+}
+
 export class ViewUtils {
+
+    private static readonly _slideStates = new WeakMap<ILightContainer, ISlideState>();
+    private static readonly _slideThrottleMs = 300;
+    private static readonly _slideHoldMs = 1500;
+    private static readonly _slideWatchdogMs = 2000;
+
+    private static getSlideState(ctrl: ILightContainer): ISlideState {
+        let state = ViewUtils._slideStates.get(ctrl);
+        if (!state) {
+            state = { lastSlideTime: 0, pinnedValue: null, holdTimer: null, watchdogTimer: null };
+            ViewUtils._slideStates.set(ctrl, state);
+        }
+        return state;
+    }
 
     /**
      * Creates switch for given ILightContainer.
@@ -47,6 +68,7 @@ export class ViewUtils {
         const step = 1;
 
         if (config.slider == SliderType.Mushroom) {
+            const pinnedValue = ViewUtils._slideStates.get(ctrl)?.pinnedValue;
             return html`
                 <${unsafeStatic(HueMushroomSliderContainer.ElementName)}
                     class="brightness-slider"
@@ -54,14 +76,14 @@ export class ViewUtils {
                     .max=${max}
                     .step=${step}
                     .disabled=${config.allowZero ? ctrl.isUnavailable() : ctrl.isOff()}
-                    .value=${ctrl.brightnessValue}
+                    .value=${pinnedValue ?? ctrl.brightnessValue}
                     .showActive=${true}
+                    @current-change=${(ev: Event) => ViewUtils.sliding(ev, ctrl)}
                     @change=${(ev: Event) => ViewUtils.changed(ev, true, ctrl, onChange)}
                 />`;
-
-            // @current-change=${this.onCurrentChange}
         }
 
+        const pinnedValue = ViewUtils._slideStates.get(ctrl)?.pinnedValue;
         return html`
         <ha-slider pin ignore-bar-touch
             class="brightness-slider"
@@ -69,23 +91,91 @@ export class ViewUtils {
             .max=${max}
             .step=${step}
             .disabled=${config.allowZero ? ctrl.isUnavailable() : ctrl.isOff()}
-            .value=${ctrl.brightnessValue}
+            .value=${pinnedValue ?? ctrl.brightnessValue}
+            @input=${(ev: Event) => ViewUtils.sliding(ev, ctrl)}
             @change=${(ev: Event) => ViewUtils.changed(ev, true, ctrl, onChange)}
         ></ha-slider>`;
     }
 
-    private static changed(ev: Event, isSlider: boolean, ctrl: ILightContainer, onChange: Action, switchOnScene?: string) {
+    private static sliding(ev: Event, ctrl: ILightContainer) {
+        const state = ViewUtils.getSlideState(ctrl);
 
-        // TODO: try to update on sliding (use throttle) not only on change. (https://www.webcomponents.org/element/@polymer/paper-slider/elements/paper-slider#events)
+        // Cancel any pending hold-cleanup from a previous gesture so it
+        // doesn't fire during this new drag and reset the pin mid-slide.
+        if (state.holdTimer) {
+            clearTimeout(state.holdTimer);
+            state.holdTimer = null;
+        }
+
+        const now = Date.now();
+        if (now - state.lastSlideTime < ViewUtils._slideThrottleMs)
+            return;
+        state.lastSlideTime = now;
+
+        const target = ev.target;
+        if (!target) return;
+
+        // mushroom slider: detail.value, ha-slider: target.value
+        const detailValue = (ev as CustomEvent).detail?.value;
+        const rawValue = detailValue ?? (target as HTMLInputElement).value;
+        if (rawValue == null) return;
+
+        const numValue = typeof rawValue === 'number' ? rawValue : parseInt(rawValue, 10);
+        if (isNaN(numValue)) return;
+
+        state.pinnedValue = numValue;
+
+        // Watchdog: if 'change' never fires (lost pointer / cancelled touch),
+        // release the pin so the slider doesn't stay stuck on a stale value.
+        if (state.watchdogTimer) {
+            clearTimeout(state.watchdogTimer);
+        }
+        state.watchdogTimer = setTimeout(() => {
+            state.pinnedValue = null;
+            state.watchdogTimer = null;
+        }, ViewUtils._slideWatchdogMs);
+
+        // Only send the service call, do NOT trigger onChange/re-render
+        // to prevent the slider from jumping back to the lagging HA state.
+        ctrl.brightnessValue = numValue;
+    }
+
+    private static changed(ev: Event, isSlider: boolean, ctrl: ILightContainer, onChange: Action, switchOnScene?: string) {
+        const existing = ViewUtils._slideStates.get(ctrl);
+        if (existing) {
+            existing.lastSlideTime = 0;
+            // Slide finished - stop the watchdog
+            if (existing.watchdogTimer) {
+                clearTimeout(existing.watchdogTimer);
+                existing.watchdogTimer = null;
+            }
+        }
 
         const target = ev.target;
         if (!target)
             return;
 
         if (isSlider) {
-            const value = (target as HTMLInputElement).value;
-            if (value != null) {
-                ctrl.brightnessValue = parseInt(value);
+            const detailValue = (ev as CustomEvent).detail?.value;
+            const rawValue = detailValue ?? (target as HTMLInputElement).value;
+            if (rawValue != null) {
+                const numValue = typeof rawValue === 'number' ? rawValue : parseInt(rawValue, 10);
+                if (!isNaN(numValue)) {
+                    // Pin the slider to the final value for a short period
+                    // so HA state lag doesn't cause a visible jump
+                    const state = ViewUtils.getSlideState(ctrl);
+                    state.pinnedValue = numValue;
+                    if (state.holdTimer) {
+                        clearTimeout(state.holdTimer);
+                    }
+                    state.holdTimer = setTimeout(() => {
+                        state.pinnedValue = null;
+                        state.holdTimer = null;
+                        onChange();
+                    }, ViewUtils._slideHoldMs);
+
+                    ctrl.brightnessValue = numValue;
+                }
             }
         }
         else { // isToggle
