@@ -404,7 +404,6 @@ export class HueDialog extends IdLitElement {
         font-size: 14px;
         font-weight: 500;
         color: var(--hue-heading-text-color);
-        text-shadow: 0 1px 3px rgba(0,0,0,0.4);
         white-space: nowrap;
     }       
     .hue-heading .brightness-slider {

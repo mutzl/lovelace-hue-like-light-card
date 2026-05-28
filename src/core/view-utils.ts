@@ -87,7 +87,9 @@ export class ViewUtils {
 
         const display = value >= 1000
             ? `${(value / 1000).toFixed(1)} k${unit}`
-            : `${value.toFixed(1)} ${unit}`;
+            : value >= 10
+                ? `${Math.round(value)} ${unit}`
+                : `${value.toFixed(1)} ${unit}`;
 
         return html`<span class="power-value">${display}</span>`;
     }
